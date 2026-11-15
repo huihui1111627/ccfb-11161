@@ -1,0 +1,135 @@
+{% extends "base.html" %}
+{% block title %}Online monitoring · Feature Platform{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h2>Online service monitoring</h2>
+    <p>Serving latency, cache behaviour, unknown-category events and the frozen encoding registry. Everything here is read from the live process or from the monitoring tables.</p>
+  </div>
+  <div class="toolbar">
+    <button class="primary" onclick="runScoringBench()">Run scoring benchmark</button>
+    <button onclick="loadHealth()">Refresh</button>
+  </div>
+</div>
+
+<div class="grid c4" style="margin-bottom:16px">
+  <div class="card">
+    <div class="kpi-label">p50 / p95 / p99</div>
+    <div class="kpi small" id="lat-kpi">—</div>
+    <div class="sub" id="lat-n">no requests yet</div>
+  </div>
+  <div class="card">
+    <div class="kpi-label">Cache hit rate</div>
+    <div class="kpi" id="cache-hit">—</div>
+    <div class="sub" id="cache-entries">—</div>
+  </div>
+  <div class="card">
+    <div class="kpi-label">Entities indexed</div>
+    <div class="kpi" id="n-entities">—</div>
+    <div class="sub">per-source inverted index, in memory</div>
+  </div>
+  <div class="card">
+    <div class="kpi-label">Unknown categories met</div>
+    <div class="kpi" id="unknown-events">0</div>
+    <div class="sub">mapped to the frozen __UNKNOWN__ bucket</div>
+  </div>
+</div>
+
+<div class="split">
+  <div class="card">
+    <h3>Latency distribution</h3>
+    <div class="spark" id="spark" style="margin-bottom:10px"></div>
+    <table>
+      <thead><tr><th>endpoint</th><th class="right">n</th><th class="right">p50</th><th class="right">p95</th><th class="right">p99</th><th class="right">max</th></tr></thead>
+      <tbody id="lat-table"><tr><td colspan="6" class="sub">Run a benchmark to populate.</td></tr></tbody>
+    </table>
+    <div class="note" style="margin-top:12px">Latency is measured inside the process around the feature computation only, excluding HTTP transport. Cache hits bypass the engine entirely.</div>
+  </div>
+
+  <div class="card">
+    <h3>Frozen encoding registry</h3>
+    {% if encodings and encodings.encodings %}
+      <div class="sub" style="margin-bottom:8px">frozen {{ encodings.frozen_at }} · policy: {{ encodings.policy.unknown }}</div>
+      <div class="table-wrap" style="max-height:420px">
+        <table>
+          <thead><tr><th>feature</th><th>dictionary</th><th class="right">default code</th></tr></thead>
+          <tbody>
+          {% for key, e in encodings.encodings.items() %}
+            <tr>
+              <td class="mono">{{ key }}</td>
+              <td>{% for c in e.dictionary %}<span class="tag encoded">{{ c }}={{ e.mapping[c] }}</span>{% endfor %}</td>
+              <td class="right num">{{ e.default_code }}</td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    {% else %}
+      <div class="sub">No frozen encodings found. Run <code>python -m feature_platform.online.encodings</code>.</div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h3>Daily drift &amp; missing-rate breaches</h3>
+  <div class="sub" style="margin-bottom:8px">Loaded from <code>monitor_drift</code>. PSI / KS / mean-shift per feature per day against a trailing reference window.</div>
+  <div class="table-wrap" style="max-height:420px">
+    <table>
+      <thead><tr><th>feature</th><th>metric</th><th class="right">days</th><th class="right">breaches</th><th class="right">avg value</th><th class="right">max value</th></tr></thead>
+      <tbody id="drift-table"><tr><td colspan="6" class="sub">Loading…</td></tr></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+function fmtUs(us) {
+  return us >= 1000 ? (us/1000).toFixed(2)+' ms' : us.toFixed(0)+' µs';
+}
+async function loadHealth() {
+  const r = await fetch('/v1/health'); const h = await r.json();
+  const lat = h.latency['score'];
+  document.getElementById('n-entities').textContent = h.entities_indexed.toLocaleString();
+  document.getElementById('unknown-events').textContent =
+    Object.values(h.unknown_category_events || {}).reduce((a,b)=>a+b,0);
+  if (lat) {
+    document.getElementById('lat-kpi').textContent =
+      `${fmtUs(lat.p50_us)} / ${fmtUs(lat.p95_us)} / ${fmtUs(lat.p99_us)}`;
+    document.getElementById('lat-n').textContent = `${lat.n.toLocaleString()} requests`;
+    document.getElementById('lat-table').innerHTML = `<tr>
+      <td class="mono">score</td><td class="right num">${lat.n}</td>
+      <td class="right num">${fmtUs(lat.p50_us)}</td><td class="right num">${fmtUs(lat.p95_us)}</td>
+      <td class="right num">${fmtUs(lat.p99_us)}</td><td class="right num">${fmtUs(lat.max_us)}</td></tr>`;
+  }
+  const c = h.cache || {};
+  if (c.hit_rate !== undefined) {
+    document.getElementById('cache-hit').textContent = (c.hit_rate*100).toFixed(1) + '%';
+    document.getElementById('cache-entries').textContent =
+      `${c.entries} entries · ${c.hits} hit · ${c.misses} miss · ${c.invalidated_source_change} evicted by source change`;
+  }
+}
+async function runScoringBench() {
+  const btn = event.target; btn.disabled = true; btn.textContent = 'Running…';
+  const ids = [];
+  for (let i = 0; i < 300; i++) ids.push('U' + String(1 + (i * 37) % 24000).padStart(7, '0'));
+  const body = {view: 'user_risk_v1',
+    requests: ids.map((e, i) => ({entity_id: e, as_of: `2025-${String(1 + i % 10).padStart(2,'0')}-1${i%9}T12:00:00`}))};
+  await fetch('/v1/score/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const r2 = await fetch('/v1/score/batch', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+  const j = await r2.json();
+  btn.disabled = false; btn.textContent = 'Run scoring benchmark';
+  await loadHealth();
+}
+async function loadDrift() {
+  const r = await fetch('/v1/monitor/drift?days=200'); const j = await r.json();
+  const rows = j.breached_features.slice(0, 40);
+  document.getElementById('drift-table').innerHTML = rows.length ? rows.map(x => `<tr>
+    <td class="mono">${x.feature}</td><td><span class="tag">${x.metric}</span></td>
+    <td class="right num">${x.days}</td><td class="right num"><span class="pill bad">${x.breaches}</span></td>
+    <td class="right num">${x.avg_value === null ? '—' : x.avg_value.toFixed(4)}</td>
+    <td class="right num">${x.max_value === null ? '—' : x.max_value.toFixed(4)}</td></tr>`).join('')
+    : '<tr><td colspan="6" class="sub">No breaches recorded. Run the drift monitor.</td></tr>';
+}
+loadHealth(); loadDrift(); setInterval(loadHealth, 5000);
+</script>
+{% endblock %}

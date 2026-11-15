@@ -1,0 +1,450 @@
+# =============================================================================
+# Feature platform specification -- single source of truth.
+#
+# Compiled twice by the platform:
+#   * feature_platform/offline/compiler.py -> DuckDB SQL (batch / training)
+#   * feature_platform/online/engine.py    -> Python execution plan (serving)
+#
+# Point-in-time contract implemented by BOTH compilers:
+#
+#     event_time     <  as_of                 -- happened in the past
+#     knowledge_time <= as_of                 -- warehouse already knew about it
+#     valid_until    >  as_of  (or IS NULL)   -- not yet cancelled / reversed
+#
+# as_of == the application's apply_time.  Nothing that happened at or after
+# apply_time may enter a feature.  The leak audit (audit/leak.py) verifies
+# this empirically against the raw event streams.
+# =============================================================================
+version: v1
+
+entity: user
+entity_key: user_id
+
+base:                       # the training-sample spine
+  table: applications
+  id: application_id
+  time: apply_time
+  entity: user_id
+
+label_table: labels
+
+sources:
+  # ---------------------------------------------------------------------------
+  # Append-only loan ingest log.  Duplicate loan_ids are restatements; take the
+  # latest ingested version that was known at as_of (T3) and drop rows whose
+  # cancellation had already happened by as_of (T4).
+  # ---------------------------------------------------------------------------
+  loans:
+    kind: event
+    table: loans
+    columns: [loan_id, user_id, loan_time, principal, term_days, interest_rate,
+              product_id, loan_status, cancelled_time, ingested_at]
+    event_time: loan_time
+    knowledge_time: ingested_at
+    valid_until: cancelled_time
+    dedupe_key: loan_id
+    dedupe_order: ingested_at
+    forbidden: [final_dpd]           # outcome column, never a feature input
+    description: "Loan disbursement log; append-only, restated on correction."
+
+  # ---------------------------------------------------------------------------
+  # Repayment schedule + payment facts.  The schedule is known when the loan is
+  # disbursed (schedule_known_at); a payment becomes a fact at repay_time.  A
+  # reversed payment (chargeback) is un-known at reversal_time (T5).
+  # ---------------------------------------------------------------------------
+  repayments:
+    kind: event
+    table: repayments
+    columns: [repayment_id, loan_id, user_id, installment_no, due_time, repay_time,
+              amount_due, amount_paid, dpd_days, status, reversal_time,
+              schedule_known_at, ingested_at]
+    event_time: due_time              # the obligation exists from its due date onward
+    knowledge_time: schedule_known_at
+    valid_until: reversal_time
+    deferred:
+      amount_paid: {known_at: repay_time, cleared_at: reversal_time}
+      repay_time:  {known_at: repay_time}
+    forbidden: [dpd_days, status]     # dpd_days is an outcome, status is final-state
+    description: "Instalment obligations and payments."
+
+  # ---------------------------------------------------------------------------
+  # SCD2 profile snapshots.  as_of_attr features must take the newest snapshot
+  # strictly before as_of AND already ingested by as_of (T6).
+  # ---------------------------------------------------------------------------
+  profile:
+    kind: scd
+    table: user_profile_history
+    columns: [profile_id, user_id, snapshot_time, credit_score, risk_level,
+              income_level, device_type, app_version, is_blacklist, ingested_at]
+    event_time: snapshot_time
+    knowledge_time: ingested_at
+    description: "Quarterly credit bureau / KYC profile snapshots."
+
+  # ---------------------------------------------------------------------------
+  # Static dimension: effective from registration onward.
+  # ---------------------------------------------------------------------------
+  user_static:
+    kind: static
+    table: users
+    columns: [user_id, register_time, channel, city_tier, age, gender, occupation,
+              education, income_level, device_type, is_employee]
+    event_time: register_time
+    knowledge_time: register_time
+    description: "Registration attributes, immutable after signup."
+
+  # ---------------------------------------------------------------------------
+  # The base application event stream, used to build user-level application
+  # history features.  DECISION-DEPENDENT COLUMNS ARE DEFERRED (T2): status,
+  # reject_reason and decision_time only exist after decision_time, and
+  # apply_time_local is a +08:00 rendering of apply_time (T1).
+  # ---------------------------------------------------------------------------
+  applications:
+    kind: event
+    table: applications
+    columns: [application_id, user_id, apply_time, apply_time_local, channel,
+              device_type, app_version, product_id, apply_amount, apply_status,
+              reject_reason, decision_time, ip_city, ingested_at]
+    event_time: apply_time
+    knowledge_time: ingested_at
+    deferred:
+      apply_status: decision_time
+      reject_reason: decision_time
+      decision_time: decision_time
+    description: "Application event stream."
+
+feature_views:
+  # ===========================================================================
+  - name: user_risk_v1
+    description: "Application-time risk view: history, behaviour, profile, encoding."
+    owner: risk-modeling
+    entity: user
+    online_ttl_seconds: 300
+    features:
+      # ---- application history -------------------------------------------
+      - name: app_cnt_7d
+        kind: window
+        source: applications
+        window: 7d
+        agg: count
+        type: int
+        fill: 0
+        tags: [history, window]
+        description: "Applications in the 7 days before this application."
+
+      - name: app_cnt_30d
+        kind: window
+        source: applications
+        window: 30d
+        agg: count
+        type: int
+        fill: 0
+        tags: [history, window]
+
+      - name: app_amt_sum_30d
+        kind: window
+        source: applications
+        window: 30d
+        agg: sum
+        column: apply_amount
+        type: float
+        fill: 0.0
+        tags: [history, window]
+
+      - name: app_amt_avg_90d
+        kind: window
+        source: applications
+        window: 90d
+        agg: avg
+        column: apply_amount
+        type: float
+        fill: 0.0
+        tags: [history, window]
+
+      - name: app_cnt_180d
+        kind: window
+        source: applications
+        window: 180d
+        agg: count
+        type: int
+        fill: 0
+        tags: [history, window]
+
+      - name: app_distinct_product_90d
+        kind: window
+        source: applications
+        window: 90d
+        agg: count_distinct
+        column: product_id
+        type: int
+        fill: 0
+        tags: [history, window]
+
+      - name: app_approved_cnt_90d
+        kind: window
+        source: applications
+        window: 90d
+        agg: count
+        where: "apply_status = 'APPROVED'"
+        type: int
+        fill: 0
+        tags: [history, window, decision]
+        description: "Prior applications approved, counting only decisions known by apply_time."
+
+      - name: days_since_first_app
+        kind: window
+        source: applications
+        window: 730d
+        agg: min
+        column: apply_time
+        transform: days_since
+        type: float
+        fill: null
+        tags: [history]
+        description: "Days since the user's first application (widest window)."
+
+      # ---- loan / borrowing behaviour (7d + 30d counts and amounts) ------
+      - name: loan_cnt_7d
+        kind: window
+        source: loans
+        window: 7d
+        agg: count
+        type: int
+        fill: 0
+        tags: [borrow, window]
+        description: "Loans disbursed in the 7 days before this application."
+
+      - name: loan_cnt_30d
+        kind: window
+        source: loans
+        window: 30d
+        agg: count
+        type: int
+        fill: 0
+        tags: [borrow, window]
+
+      - name: loan_amt_sum_7d
+        kind: window
+        source: loans
+        window: 7d
+        agg: sum
+        column: principal
+        type: float
+        fill: 0.0
+        tags: [borrow, window]
+        description: "Principal disbursed in the last 7 days."
+
+      - name: loan_amt_sum_30d
+        kind: window
+        source: loans
+        window: 30d
+        agg: sum
+        column: principal
+        type: float
+        fill: 0.0
+        tags: [borrow, window]
+
+      - name: loan_amt_avg_180d
+        kind: window
+        source: loans
+        window: 180d
+        agg: avg
+        column: principal
+        type: float
+        fill: 0.0
+        tags: [borrow, window]
+
+      - name: loan_cnt_365d
+        kind: window
+        source: loans
+        window: 365d
+        agg: count
+        type: int
+        fill: 0
+        tags: [borrow, window]
+
+      - name: loan_interest_max_90d
+        kind: window
+        source: loans
+        window: 90d
+        agg: max
+        column: interest_rate
+        type: float
+        fill: null
+        tags: [borrow, window]
+
+      - name: loan_last_principal
+        kind: window
+        source: loans
+        window: 180d
+        agg: last
+        column: principal
+        type: float
+        fill: null
+        tags: [borrow, recency]
+
+      # ---- repayment obligations -----------------------------------------
+      - name: overdue_instalments_cnt
+        kind: window
+        source: repayments
+        window: 90d
+        agg: count
+        where: "repay_time is null"
+        type: int
+        fill: 0
+        tags: [repay, window]
+        description: "Instalments due in the last 90d with no payment fact known yet."
+
+      - name: scheduled_due_amt_30d
+        kind: window
+        source: repayments
+        window: 30d
+        agg: sum
+        column: amount_due
+        type: float
+        fill: 0.0
+        tags: [repay, window]
+
+      - name: paid_amt_sum_30d
+        kind: window
+        source: repayments
+        window: 30d
+        agg: sum
+        column: amount_paid
+        where: "amount_paid is not null"
+        type: float
+        fill: 0.0
+        tags: [repay, window]
+        description: "Payments made in the last 30d (payments are knowledge-time facts)."
+
+      - name: paid_amt_sum_90d
+        kind: window
+        source: repayments
+        window: 90d
+        agg: max
+        column: amount_paid
+        where: "amount_paid is not null"
+        type: float
+        fill: 0.0
+        tags: [repay, window]
+        description: "Paid amount in the last 90d (paid facts only)."
+
+      # ---- SCD profile (point-in-time snapshot) --------------------------
+      - name: credit_score
+        kind: asof_attr
+        source: profile
+        attr: credit_score
+        type: int
+        fill: null
+        tags: [profile, scd]
+        description: "Latest bureau score snapshot strictly before apply_time."
+
+      - name: risk_level_code
+        kind: asof_attr
+        source: profile
+        attr: risk_level
+        type: int
+        tags: [profile, scd, encoded]
+        encoder:
+          dictionary: [low, medium, high]
+          default: __UNKNOWN__
+
+      - name: is_blacklisted
+        kind: asof_attr
+        source: profile
+        attr: is_blacklist
+        type: bool
+        fill: false
+        tags: [profile, scd]
+
+      - name: rejected_cnt_180d
+        kind: window
+        source: applications
+        window: 180d
+        agg: count
+        where: "reject_reason is not null"
+        type: int
+        fill: 0
+        tags: [history, window, decision]
+        description: "Prior rejections whose reject_reason was known by apply_time."
+
+      - name: last_decision_reason_code
+        kind: window
+        source: applications
+        window: 90d
+        agg: last
+        column: reject_reason
+        type: int
+        fill: "__NONE__"
+        tags: [history, decision, encoded]
+        encoder:
+          dictionary: [risk_score_low, insufficient_income, fraud_suspect, over_indebted, "__NONE__"]
+          default: __UNKNOWN__
+        description: "Most recent decision reason known before apply_time."
+
+      # ---- static attributes ---------------------------------------------
+      - name: city_tier_code
+        kind: static_attr
+        source: user_static
+        attr: city_tier
+        type: int
+        tags: [static, encoded]
+        encoder:
+          dictionary: [tier1, tier2, tier3, tier4]
+          default: __UNKNOWN__
+
+      - name: occupation_code
+        kind: static_attr
+        source: user_static
+        attr: occupation
+        type: int
+        tags: [static, encoded]
+        encoder:
+          dictionary: [salaried, self_employed, freelance, student, retired]
+          default: __UNKNOWN__
+
+      - name: account_age_days
+        kind: static_attr
+        source: user_static
+        attr: register_time
+        transform: days_since
+        type: float
+        tags: [static, time]
+        description: "Days since registration at apply_time (derived in place)."
+
+      # ---- derived --------------------------------------------------------
+      - name: loan_to_app_ratio_30d
+        kind: derived
+        expr: "case when app_cnt_30d > 0 then loan_cnt_30d / app_cnt_30d else 0.0 end"
+        fill: 0.0
+        type: float
+        tags: [derived]
+        description: "Approval conversion proxy in the last 30d."
+
+      - name: amt_per_app_30d
+        kind: derived
+        expr: "case when app_cnt_30d > 0 then app_amt_sum_30d / app_cnt_30d else 0.0 end"
+        fill: 0.0
+        type: float
+        tags: [derived]
+
+      - name: recent_borrow_intensity
+        kind: derived
+        expr: "loan_cnt_7d * 2.0 + loan_cnt_30d"
+        fill: 0.0
+        type: float
+        tags: [derived]
+        description: "Recency-weighted borrow count."
+
+      - name: has_overdue_flag
+        kind: derived
+        expr: "case when overdue_instalments_cnt > 0 then 1 else 0 end"
+        fill: 0
+        type: int
+        tags: [derived]
+
+      # ---- constant -------------------------------------------------------
+      - name: spec_version_code
+        kind: constant
+        value: 1
+        type: int
+        tags: [model]

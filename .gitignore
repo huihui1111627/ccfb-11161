@@ -16,3 +16,11 @@ node_modules/
 __pycache__/
 .venv/
 venv/
+
+# generated artifacts (regenerate with scripts/build_all.py)
+data/*.duckdb
+data/online_index/
+data/training/
+reports/
+.pytest_cache/
+*.egg-info/

@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}Feature Platform{% endblock %}</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+<div class="layout">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">FP</div>
+      <div>
+        <h1>Feature Platform</h1>
+        <small>point-in-time · dual-engine</small>
+      </div>
+    </div>
+    <nav class="nav">
+      <a href="/" class="{{ 'active' if active=='dashboard' }}"><span class="ico">◎</span> Overview</a>
+      <a href="/ui/features" class="{{ 'active' if active=='features' }}"><span class="ico">≡</span> Feature definitions</a>
+      <a href="/ui/views" class="{{ 'active' if active=='views' }}"><span class="ico">▤</span> Feature views</a>
+      <a href="/ui/training" class="{{ 'active' if active=='training' }}"><span class="ico">◇</span> Training samples</a>
+      <a href="/ui/monitoring" class="{{ 'active' if active=='monitoring' }}"><span class="ico">◔</span> Online monitoring</a>
+      <a href="/ui/consistency" class="{{ 'active' if active=='consistency' }}"><span class="ico">⇄</span> Consistency check</a>
+      <a href="/docs" target="_blank"><span class="ico">↗</span> API docs</a>
+    </nav>
+    <footer>
+      spec <span class="mono">{{ spec_fingerprint }}</span><br/>
+      {{ n_views }} view · dual compiler
+    </footer>
+  </aside>
+  <main class="main">
+    {% block content %}{% endblock %}
+  </main>
+</div>
+{% block scripts %}{% endblock %}
+</body>
+</html>

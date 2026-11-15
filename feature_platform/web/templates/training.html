@@ -1,0 +1,112 @@
+{% extends "base.html" %}
+{% block title %}Training samples · Feature Platform{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h2>Training sample generation</h2>
+    <p>One row per application, features computed at <code>as_of = apply_time</code>. Splits are chronological, and labels carry the instant they became observable so no sample can be trained on an outcome that did not exist yet.</p>
+  </div>
+</div>
+
+<div class="grid c4" style="margin-bottom:16px">
+  {% for split in ['train','valid','test'] %}
+  <div class="card">
+    <div class="kpi-label">{{ split }}</div>
+    <div class="kpi">{{ meta.rows.get(split, '—') if meta else '—' }}</div>
+    <div class="sub">bad rate {{ '%.2f%%'|format((meta.label_rates.get(split, 0) if meta else 0)*100) }}</div>
+  </div>
+  {% endfor %}
+  <div class="card">
+    <div class="kpi-label">Leak audit</div>
+    <div class="kpi {{ 'ok' if leak.verdict == 'PASS' else 'bad' }}" style="color:{{ 'var(--good)' if leak.verdict == 'PASS' else 'var(--bad)' }}">{{ leak.verdict or '—' }}</div>
+    <div class="sub">{{ leak.proof_1_prefix_stability.cells_compared if leak else 0 }} cells · prefix + boundary proofs</div>
+  </div>
+</div>
+
+<div class="split">
+  <div class="card">
+    <h3>Point-in-time guarantees</h3>
+    <table>
+      <thead><tr><th>proof</th><th>what it shows</th><th class="right">result</th></tr></thead>
+      <tbody>
+        <tr>
+          <td><strong>Prefix stability</strong></td>
+          <td class="sub">Recompute features on a warehouse physically truncated to <code>event_time &le; as_of AND knowledge_time &le; as_of</code>; must equal the full-warehouse result.</td>
+          <td class="right"><span class="pill {{ 'good' if leak and leak.proof_1_prefix_stability.violations == 0 else 'bad' }}">{{ leak.proof_1_prefix_stability.violations if leak else '—' }} viol</span></td>
+        </tr>
+        <tr>
+          <td><strong>Boundary mutation</strong></td>
+          <td class="sub">Perturb every row that was not fully known before <code>as_of</code>; no feature may change.</td>
+          <td class="right"><span class="pill {{ 'good' if leak and leak.proof_2_boundary_mutation.violations == 0 else 'bad' }}">{{ leak.proof_2_boundary_mutation.violations if leak else '—' }} viol</span></td>
+        </tr>
+        <tr>
+          <td><strong>Negative controls</strong></td>
+          <td class="sub">Remove each point-in-time rule in turn; every removal must be detectable, otherwise the audit has no teeth.</td>
+          <td class="right"><span class="pill {{ 'good' if leak and leak.proof_4_negative_controls.all_detected else 'bad' }}">{{ 'all 7 detected' if leak and leak.proof_4_negative_controls.all_detected else '—' }}</span></td>
+        </tr>
+      </tbody>
+    </table>
+
+    {% if leak %}
+    <h3 style="margin-top:18px">Negative controls detail</h3>
+    <table>
+      <thead><tr><th>rule removed</th><th class="right">cells changed</th><th>affected features</th></tr></thead>
+      <tbody>
+      {% for name, c in leak.proof_4_negative_controls.controls.items() %}
+        <tr>
+          <td class="mono">{{ name }}</td>
+          <td class="right num">{{ c.cells_changed }}</td>
+          <td class="sub">{{ c.features|join(', ') }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>Split policy</h3>
+    <pre style="max-height:150px">as_of &lt; {{ meta.train_end if meta else '2024-11-01' }}          → train
+as_of &lt; {{ meta.valid_end if meta else '2025-04-01' }}          → valid
+otherwise                    → test</pre>
+    <div class="note warn">No random splits: random splits leak through users and through time, which is the most common reason a model looks great offline and collapses in production.</div>
+
+    <h3 style="margin-top:18px">Naive pipeline contrast</h3>
+    {% if leak %}
+    <table>
+      <thead><tr><th>naive variant</th><th class="right">cells diff</th><th class="right">AUC</th></tr></thead>
+      <tbody>
+      {% for name, v in leak.proof_3_naive_baseline.variants.items() %}
+        <tr>
+          <td class="mono">{{ name }}</td>
+          <td class="right num">{{ v.differing_cells }}</td>
+          <td class="right num">{{ '%.4f'|format(v.auc) }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="sub" style="margin-top:8px">platform AUC {{ leak.proof_3_naive_baseline.auc_platform }}</div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h3>Sample rows</h3>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>application</th><th>entity</th><th>as_of</th><th>label</th><th>label_ready_time</th></tr></thead>
+      <tbody>
+      {% for r in sample_rows %}
+        <tr>
+          <td class="mono">{{ r.application_id }}</td>
+          <td class="mono">{{ r.entity_id }}</td>
+          <td class="mono">{{ r.__as_of }}</td>
+          <td><span class="pill {{ 'bad' if r.label == 1 else 'good' }}">{{ r.label }}</span></td>
+          <td class="mono">{{ r.__label_ready_time }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

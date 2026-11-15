@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}Overview · Feature Platform{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h2>Overview</h2>
+    <p>One declarative feature definition compiles to two engines: DuckDB SQL for batch / training and a Python evaluator for online scoring. Every feature obeys the same point-in-time contract at both ends.</p>
+  </div>
+  <div class="toolbar">
+    <span class="chip {{ 'ok' if leak.verdict == 'PASS' else 'warn' }}">leak audit {{ leak.verdict or 'n/a' }}</span>
+    <span class="chip">spec {{ spec_fingerprint }}</span>
+  </div>
+</div>
+
+<div class="grid c4" style="margin-bottom:16px">
+  <div class="card">
+    <div class="kpi-label">Features</div>
+    <div class="kpi">{{ total_features }}</div>
+    <div class="sub">{{ views|length }} view · {{ views[0].features|selectattr('encoder')|list|length if views else 0 }} frozen encodings</div>
+  </div>
+  <div class="card">
+    <div class="kpi-label">Online p95 latency</div>
+    {% set lat = health.latency.get('score') %}
+    <div class="kpi">{{ (lat.p95_us / 1000)|round(1) if lat else '—' }}<span style="font-size:13px;color:var(--muted)"> ms</span></div>
+    <div class="sub">{{ lat.n if lat else 0 }} scored requests this process</div>
+  </div>
+  <div class="card">
+    <div class="kpi-label">Parity mismatch</div>
+    {% set ex = parity.get('exact', {}) %}
+    <div class="kpi {{ 'ok' if ex and ex.row_mismatch_rate == 0 }}">{{ '%.4f%%'|format((ex.row_mismatch_rate or 0)*100) if ex else '—' }}</div>
+    <div class="sub">{{ ex.n_compared if ex else 0 }} rows × {{ ex.n_features if ex else 0 }} features, exact as_of</div>
+  </div>
+  <div class="card">
+    <div class="kpi-label">Cache hit rate</div>
+    <div class="kpi">{{ '%.1f%%'|format((health.cache.hit_rate or 0)*100) }}</div>
+    <div class="sub">{{ health.cache.entries or 0 }} entries · {{ health.cache.invalidated_source_change or 0 }} invalidated by source change</div>
+  </div>
+</div>
+
+<div class="split">
+  <div class="card">
+    <h3>Feature views</h3>
+    <table>
+      <thead><tr><th>view</th><th>owner</th><th class="right">features</th><th>sources</th></tr></thead>
+      <tbody>
+      {% for v in views %}
+        <tr>
+          <td><a href="/ui/features">{{ v.name }}</a><div class="sub">{{ v.description }}</div></td>
+          <td class="mono">{{ v.owner }}</td>
+          <td class="right num">{{ v.features|length }}</td>
+          <td>{% for d in v.features|map(attribute='source')|reject('none')|unique %}<span class="tag">{{ d }}</span>{% endfor %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    <div class="note" style="margin-top:14px">
+      Each view compiles to a single SQL statement with one <code>LEFT JOIN LATERAL</code> per window feature. Serving re-reads the same spec through the Python engine, which is why the two agree cell-for-cell.
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Point-in-time contract</h3>
+    <p class="sub">Every source row must satisfy all four conditions to contribute at <code>as_of</code>:</p>
+    <pre style="max-height:200px">event_time      &lt;  as_of     -- strictly past
+knowledge_time  &lt;= as_of     -- already ingested
+valid_until     &gt;  as_of     -- not cancelled / reversed
+deferred col    known_at &lt;= as_of</pre>
+    <h3 style="margin-top:16px">Leak audit</h3>
+    {% if leak %}
+      <table>
+        <tbody>
+          <tr><td>Proof 1 · truncated warehouse</td><td class="right"><span class="pill {{ 'good' if leak.proof_1_prefix_stability.violations == 0 else 'bad' }}">{{ leak.proof_1_prefix_stability.violations }} viol</span></td></tr>
+          <tr><td>Proof 2 · boundary mutation</td><td class="right"><span class="pill {{ 'good' if leak.proof_2_boundary_mutation.violations == 0 else 'bad' }}">{{ leak.proof_2_boundary_mutation.violations }} viol</span></td></tr>
+          <tr><td>Proof 3 · naive baseline</td><td class="right"><span class="pill warn">{{ '%.2f%%'|format((leak.proof_3_naive_baseline.get('variants', {}).get('all_naive', {}).get('differing_cell_rate') or 0)*100) }} diff</span></td></tr>
+          <tr><td>Proof 4 · negative controls</td><td class="right"><span class="pill {{ 'good' if leak.proof_4_negative_controls.all_detected else 'bad' }}">{{ 'all detected' if leak.proof_4_negative_controls.all_detected else 'missed' }}</span></td></tr>
+        </tbody>
+      </table>
+      <div class="sub" style="margin-top:8px">platform AUC {{ leak.proof_3_naive_baseline.auc_platform }} vs all-naive {{ leak.proof_3_naive_baseline.variants.all_naive.auc }}</div>
+    {% else %}
+      <div class="sub">Run <code>python -m feature_platform.audit.leak</code> to produce the report.</div>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h3>Try the online endpoint</h3>
+  <div class="toolbar">
+    <input id="entity" value="U0000001" style="width:150px" />
+    <input id="asof" value="2025-06-01T12:00:00" style="width:220px" />
+    <button class="primary" onclick="score()">Score</button>
+    <span class="sub" id="lat"></span>
+  </div>
+  <pre id="out" style="max-height:340px">—</pre>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+async function score() {
+  const out = document.getElementById('out');
+  const lat = document.getElementById('lat');
+  out.textContent = 'scoring…';
+  const t0 = performance.now();
+  const r = await fetch('/v1/score', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({view: 'user_risk_v1', entity_id: document.getElementById('entity').value,
+                          as_of: document.getElementById('asof').value})
+  });
+  const j = await r.json();
+  const ms = performance.now() - t0;
+  lat.textContent = `round-trip ${ms.toFixed(1)} ms · engine ${j.latency_us} µs · cache ${j.cache_hit ? 'hit' : 'miss'}`;
+  out.textContent = JSON.stringify(j, null, 2);
+}
+</script>
+{% endblock %}

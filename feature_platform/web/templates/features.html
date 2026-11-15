@@ -1,0 +1,84 @@
+{% extends "base.html" %}
+{% block title %}Feature definitions · Feature Platform{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h2>Feature definitions</h2>
+    <p>Declared once in YAML, compiled twice. Sources carry the temporal metadata that makes point-in-time evaluation possible: event time, knowledge time, validity, and deferred (decision-dependent) columns.</p>
+  </div>
+</div>
+
+<div class="card" style="margin-bottom:16px">
+  <h3>Sources</h3>
+  <div class="table-wrap" style="max-height:340px">
+    <table>
+      <thead>
+        <tr><th>source</th><th>kind</th><th>event_time</th><th>knowledge_time</th><th>valid_until</th><th>dedupe</th><th>deferred</th></tr>
+      </thead>
+      <tbody>
+      {% for name, s in sources.items() %}
+        <tr>
+          <td><strong>{{ name }}</strong><div class="sub">{{ s.table }}</div></td>
+          <td><span class="tag">{{ s.kind }}</span></td>
+          <td class="mono">{{ s.event_time }}</td>
+          <td class="mono">{{ s.knowledge_time }}</td>
+          <td class="mono">{{ s.valid_until or '—' }}</td>
+          <td class="mono">{{ s.dedupe_key or '—' }}</td>
+          <td>{% for col, d in s.deferred.items() %}<span class="tag decision">{{ col }}@{{ d.known_at }}</span>{% endfor %}{% if not s.deferred %}—{% endif %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% for v in views %}
+<div class="card" style="margin-bottom:16px">
+  <div class="toolbar" style="justify-content:space-between">
+    <div>
+      <h3 style="margin:0">{{ v.name }}</h3>
+      <div class="sub">{{ v.description }} · owner {{ v.owner }} · TTL {{ v.online_ttl_seconds }}s</div>
+    </div>
+    <span class="chip">{{ v.features|length }} features</span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>feature</th><th>kind</th><th>type</th><th>definition</th><th>fill</th><th>tags</th></tr>
+      </thead>
+      <tbody>
+      {% for f in v.ordered() %}
+        <tr>
+          <td><strong class="mono">{{ f.name }}</strong>{% if f.description %}<div class="sub">{{ f.description }}</div>{% endif %}</td>
+          <td><span class="tag {{ f.kind }}">{{ f.kind }}</span></td>
+          <td class="mono">{{ f.type }}</td>
+          <td class="mono" style="font-size:11.5px">
+            {% if f.kind == 'window' %}
+              {{ f.agg }}{% if f.column %}({{ f.column }}){% endif %} over <strong>{{ f.window }}</strong> of <strong>{{ f.source }}</strong>
+              {% if f.transform %} → {{ f.transform }}{% endif %}
+              {% if f.where %}<div class="sub">where {{ f.where }}</div>{% endif %}
+            {% elif f.kind in ('asof_attr','static_attr') %}
+              {{ f.source }}.{{ f.attr }}{% if f.transform %} → {{ f.transform }}{% endif %}
+            {% elif f.kind == 'derived' %}
+              {{ f.expr }}
+            {% elif f.kind == 'constant' %}
+              {{ f.value }}
+            {% endif %}
+            {% if f.encoder %}<div class="sub">encoder: {{ f.encoder.dictionary|join(' · ') }} + {{ f.encoder.default }}</div>{% endif %}
+          </td>
+          <td class="mono">{{ f.fill if f.fill is not none else 'NULL' }}</td>
+          <td>{% for t in f.tags %}<span class="tag {{ t }}">{{ t }}</span>{% endfor %}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endfor %}
+
+<div class="card">
+  <h3>Compiled SQL (offline engine)</h3>
+  <div class="sub" style="margin-bottom:8px">Generated from the YAML above — this is the exact statement used to build training samples.</div>
+  <pre>{{ compiled_sql }}</pre>
+</div>
+{% endblock %}

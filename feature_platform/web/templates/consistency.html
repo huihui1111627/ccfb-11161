@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}Consistency check · Feature Platform{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <h2>Offline / online consistency</h2>
+    <p>The same user at the same instant, scored by the batch compiler and by the online engine. Mismatches are counted per feature cell, and every one is reproducible from the recorded pair.</p>
+  </div>
+  <div class="toolbar">
+    <select id="mode"><option value="exact">exact as_of</option><option value="skew">±2s jitter</option></select>
+    <input id="nrun" type="number" value="100" min="10" max="1000" style="width:90px" />
+    <button class="primary" onclick="runCheck()">Run consistency check</button>
+  </div>
+</div>
+
+<div class="grid c4" style="margin-bottom:16px">
+  {% set ex = parity.get('exact', {}) %}
+  {% set sk = parity.get('skew', {}) %}
+  <div class="card">
+    <div class="kpi-label">Exact-mode mismatch</div>
+    <div class="kpi" id="ex-rate" style="color:{{ 'var(--good)' if ex and ex.cell_mismatch_rate == 0 else 'var(--warn)' }}">
+      {{ '%.4f%%'|format((ex.cell_mismatch_rate or 0)*100) if ex else '—' }}
+    </div>
+    <div class="sub" id="ex-sub">{{ ex.mismatch_rows if ex else 0 }} / {{ ex.n_compared if ex else 0 }} rows</div>
+  </div>
+  <div class="card">
+    <div class="kpi-label">Skew-mode mismatch</div>
+    <div class="kpi" id="sk-rate">{{ '%.4f%%'|format((sk.cell_mismatch_rate or 0)*100) if sk else '—' }}</div>
+    <div class="sub">{{ sk.mismatch_rows if sk else 0 }} / {{ sk.n_compared if sk else 0 }} rows</div>
+  </div>
+  <div class="card">
+    <div class="kpi-label">Cells compared</div>
+    <div class="kpi" id="cells">{{ (ex.n_compared * ex.n_features) if ex else 0 }}</div>
+    <div class="sub">{{ ex.n_features if ex else 0 }} features × rows</div>
+  </div>
+  <div class="card">
+    <div class="kpi-label">Tolerance</div>
+    <div class="kpi small">1e-9</div>
+    <div class="sub">relative for floats, exact for ints / strings / bools, NULL == NULL</div>
+  </div>
+</div>
+
+<div class="split">
+  <div class="card">
+    <h3>Per-feature mismatch (parity report)</h3>
+    {% if parity %}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>feature</th><th class="right">exact</th><th class="right">skew</th><th class="right">max |Δ|</th></tr></thead>
+        <tbody>
+        {% set allf = [] %}
+        {% for mode in ['exact','skew'] %}
+          {% for f in parity[mode].per_feature_with_mismatch.keys() %}{% if f not in allf %}{% set _ = allf.append(f) %}{% endif %}{% endfor %}
+        {% endfor %}
+        {% if allf %}
+          {% for f in allf %}
+          <tr>
+            <td class="mono">{{ f }}</td>
+            <td class="right num">{% set s = parity.exact.per_feature_with_mismatch.get(f) %}{{ s.mismatches if s else 0 }}</td>
+            <td class="right num">{% set s2 = parity.skew.per_feature_with_mismatch.get(f) %}{{ s2.mismatches if s2 else 0 }}</td>
+            <td class="right num">{% set s3 = parity.exact.per_feature_with_mismatch.get(f) %}{{ '%.6g'|format(s3.max_abs_diff) if s3 else '0' }}</td>
+          </tr>
+          {% endfor %}
+        {% else %}
+          <tr><td colspan="4"><span class="pill good">all features agree exactly</span></td></tr>
+        {% endif %}
+        </tbody>
+      </table>
+    </div>
+    {% else %}
+      <div class="sub">No parity report. Run <code>python -m feature_platform.audit.parity</code>.</div>
+    {% endif %}
+
+    <h3 style="margin-top:18px">Recent monitor runs</h3>
+    <div class="table-wrap" style="max-height:300px">
+      <table>
+        <thead><tr><th>run_ts</th><th>mode</th><th class="right">requests</th><th class="right">mismatches</th><th class="right">rate</th></tr></thead>
+        <tbody id="runs"><tr><td colspan="5" class="sub">Loading…</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3>Live run</h3>
+    <div class="sub">Triggered through <code>/v1/monitor/consistency/run</code>. Half the keys are application instants (highest boundary risk), half are random instants in each user's life (the serving case).</div>
+    <pre id="runout" style="max-height:440px">—</pre>
+    <div class="note good" style="margin-top:12px">Exact mode must be 0. Skew mode may show a handful of window-boundary differences; that is a time-of-check artefact, not a pipeline bug, and it should stay far below 1%.</div>
+  </div>
+</div>
+
+<div class="card" style="margin-top:16px">
+  <h3>Mismatch examples</h3>
+  <div class="sub">Every pair is recorded with its entity and instant so it can be replayed against the batch engine.</div>
+  <pre id="examples" style="max-height:340px">—</pre>
+</div>
+{% endblock %}
+{% block scripts %}
+<script>
+async function loadRuns() {
+  const r = await fetch('/v1/monitor/consistency?days=90'); const j = await r.json();
+  const rows = (j.recent_runs || []);
+  document.getElementById('runs').innerHTML = rows.length ? rows.map(x => `<tr>
+    <td class="mono">${x.run_ts}</td><td>${x.mode}</td>
+    <td class="right num">${x.n_requests}</td>
+    <td class="right num"><span class="pill ${x.mismatches ? 'warn' : 'good'}">${x.mismatches}</span></td>
+    <td class="right num">${(x.cell_mismatch_rate*100).toFixed(4)}%</td></tr>`).join('')
+    : '<tr><td colspan="5" class="sub">No runs recorded yet.</td></tr>';
+}
+async function runCheck() {
+  const mode = document.getElementById('mode').value;
+  const n = document.getElementById('nrun').value;
+  const out = document.getElementById('runout');
+  out.textContent = 'running…';
+  const r = await fetch(`/v1/monitor/consistency/run?n=${n}&mode=${mode}`, {method:'POST'});
+  const j = await r.json();
+  out.textContent = JSON.stringify({mode: j.mode, requests: j.n_requests, features: j.n_features,
+    cells: j.cells_compared, mismatches: j.mismatches,
+    cell_mismatch_rate: j.cell_mismatch_rate, request_mismatch_rate: j.request_mismatch_rate,
+    duration_ms: j.duration_ms}, null, 2);
+  document.getElementById('examples').textContent = JSON.stringify(j.examples, null, 2);
+  if (j.mode === 'exact') {
+    document.getElementById('ex-rate').textContent = (j.cell_mismatch_rate*100).toFixed(4) + '%';
+    document.getElementById('ex-sub').textContent = `${j.mismatches} mismatching cells / ${j.n_requests} rows`;
+  }
+  await loadRuns();
+}
+loadRuns();
+</script>
+{% endblock %}
